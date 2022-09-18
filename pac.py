@@ -814,3 +814,85 @@ class PacPool2d(_PacConvNd):
                            self.native_impl)
 
         return output if output_mask is None else (output, output_mask)
+    
+    
+class Conv2dFn(Function):
+    @staticmethod
+    def forward(ctx, input, kernel, bias=None, kernel_size=3, stride=1, padding=0, dilation=1):
+        (bs, ch), in_sz = input.shape[:2], input.shape[2:]
+        if kernel.size(1) > 1 and kernel.size(1) != ch:
+            raise ValueError('Incompatible input and kernel sizes.')
+        ctx.input_size = in_sz
+        ctx.kernel_size = _pair(kernel_size)
+        ctx.kernel_ch = kernel.size(1)
+        ctx.dilation = _pair(dilation)
+        ctx.padding = _pair(padding)
+        ctx.stride = _pair(stride)
+        ctx.save_for_backward(input if ctx.needs_input_grad[1] else None,
+                              kernel if ctx.needs_input_grad[0] else None)
+
+        cols = F.unfold(input, ctx.kernel_size, ctx.dilation, ctx.padding, ctx.stride)
+
+        output = cols.view(bs, ch, *kernel.shape[2:]) * kernel
+        output = torch.einsum('ijklmn->ijmn', (output,))
+        
+        if bias is not None:
+            output += bias.view(1, -1, 1, 1)
+
+        return output.clone()  # TODO check whether a .clone() is needed here
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output):
+        input, kernel = ctx.saved_tensors
+        grad_input = grad_kernel = grad_bias = None
+        (bs, ch), out_sz = grad_output.shape[:2], grad_output.shape[2:]
+        if ctx.needs_input_grad[0]:
+            grad_input = grad_output.new()
+            grad_im2col_output = torch.einsum('ijmn,izklmn->ijklmn', (grad_output, kernel))
+            grad_im2col_output = grad_im2col_output.view(bs, -1, out_sz[0] * out_sz[1])
+            ctx._backend.Im2Col_updateGradInput(ctx._backend.library_state,
+                                                grad_im2col_output,
+                                                grad_input,
+                                                ctx.input_size[0], ctx.input_size[1],
+                                                ctx.kernel_size[0], ctx.kernel_size[1],
+                                                ctx.dilation[0], ctx.dilation[1],
+                                                ctx.padding[0], ctx.padding[1],
+                                                ctx.stride[0], ctx.stride[1])
+        if ctx.needs_input_grad[1]:
+            cols = F.unfold(input, ctx.kernel_size, ctx.dilation, ctx.padding, ctx.stride)
+            cols = cols.view(bs, ch, ctx.kernel_size[0], ctx.kernel_size[1], out_sz[0], out_sz[1])
+            grad_kernel = torch.einsum('ijmn,ijklmn->ijklmn', (grad_output, cols))
+            if ctx.kernel_ch == 1:
+                grad_kernel = grad_kernel.sum(dim=1, keepdim=True)
+        
+        if ctx.needs_input_grad[2]:
+            grad_bias = torch.einsum('iomn->o', (grad_output,))
+
+        return grad_input, grad_kernel, grad_bias, None, None, None, None
+    
+    
+def conv2d(input, kernel, bias=None, kernel_size=1, stride=1, padding=0, dilation=1, native_impl=False):
+    kernel_size = _pair(kernel_size)
+    stride = _pair(stride)
+    padding = _pair(padding)
+    dilation = _pair(dilation)
+
+    if native_impl:
+        bs, in_ch, in_h, in_w = input.shape
+        out_h = (in_h + 2 * padding[0] - dilation[0] * (kernel_size[0] - 1) - 1) // stride[0] + 1
+        out_w = (in_w + 2 * padding[1] - dilation[1] * (kernel_size[1] - 1) - 1) // stride[1] + 1
+
+        # im2col on input
+        im_cols = nd2col(input, kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation)
+
+        # main computation
+        im_cols *= kernel
+        output = im_cols.view(bs, in_ch, -1, out_h, out_w).sum(dim=2, keepdim=False)
+        
+        if bias is not None:
+            output += bias.view(1, -1, 1, 1)
+    else:
+        output = Conv2dFn.apply(input, kernel, bias, kernel_size, stride, padding, dilation)
+
+    return output
